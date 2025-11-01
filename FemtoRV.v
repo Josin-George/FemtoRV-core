@@ -103,5 +103,85 @@ begin
                 aluShamt <= aluInt2[4:0];
             end
         end
+
+`ifdef NRV_TWOLEVEL_SHIFTER
+    else if (|aluShamt[4:2]) 
+        begin
+            aluShamt <= aluShamt - 4;
+            aluReg <= funct3Is[1] ? aluReg << 4 : {{4{instr[30] & aluReg[31]}}, aluReg[31:4]};
+            
+        end
+    else
+`endif 
+    if(|aluShamt) 
+    begin
+        aluShamt <= aluShamt - 1;
+        aluReg <= funct3Is[1] ? aluReg << 1 : //SLL
+        {instr[30] & aluReg[31], aluReg[31:1]};//SRA,SRL
+    end
 end
 
+//The predicate or conditional branches
+wire predicate = 
+    funct3Is[0] &   EQ |//BEQ
+    funct3Is[0] & ! EQ |//BNE
+    funct3Is[0] &   LT |//BLT
+    funct3Is[0] &  !LT |//BGE
+    funct3Is[0] &  LTU |//BLTU
+    funct3Is[0] & !LTU ;//BGEU
+
+//program counter and branch target computation
+
+reg [ADDR_WIDTH-1:0] PC;//Program counter
+reg [31:2] instr;
+
+wire [ADDR_WIDTH-1:0] PCplus = PC + 4;
+
+wire [ADDR_WIDTH-1:0] PCplusImm = PC + (instr[3] ? Jimm[ADDR_WIDTH-1:0] : instr[4] ? Uimm[ADDR_WIDTH-1:0] : Bimm[ADDR_WIDTH-1 : 0]);
+
+wire [ADDR_WIDTH-1:0] loadstore_addr = rs1[ADDR_WIDTH-1:0] + (instr[5] ? Simm[ADDR_WIDTH-1:0] : Iimm[ADDR_WIDTH-1:0]);
+
+assign mem_addr = state[WAIT_INSTR_bit] | state[FETCH_INSTR_bit] ? PC : loadstore_addr;
+
+//The value written back to the register file 
+
+wire [31:0] writeBackData = 
+    (isSYSTEM ? cycles      : 32'b0) | //System
+    (isSYSTEM ? Uimm        : 32'b0) | //LUI
+    (isSYSTEM ? aluOut      : 32'b0) | //ALUreg, ALUImm
+    (isSYSTEM ? PCplusImm   : 32'b0) | //AUIPC
+    (isSYSTEM ? PCplus4     : 32'b0) | //JAL,JALR
+    (isSYSTEM ? LOAD_data   : 32'b0); //Load
+
+//Load/Store
+
+wire mem_byteAccess = instr[31:12] == 2'b00; //funct3[1:0] == 2'b00;
+wire mem_halfwordAccess = instr[31:12] == 2'b01;//funct3[1:0] == 2'b01;
+
+wire LOAD_sign = !instr[14] & (mem_byteAccess ? LOAD_byte[7] : LOAD_halfword[15]);
+wire [31:0] LOAD_data = mem_byteAccess ? {{24{LOAD_sign}}, LOAD_byte} : mem_halfwordAccess ? {{16{LOAD_sign}}, LOAD_halfword} : mem_rdata;
+wire [15:0] LOAD_halfword = loadstore_addr[1] ? mem_rdata[31:16] : mem_rdata[15:0];
+wire [7:0] LOAD_byte = loadstore_addr[0] ? LOAD_halfword[15:8] : LOAD_halfword[7:0];
+
+//Store
+assign mem_wdata[7:0] = rs2[7:0];
+assign mem_wdata[15:8] = loadstore_addr[0] ? rs2[7:0] : rs2[15:8];
+assign mem_wdata[23:16] = loadstore_addr[1] ? rs2[7:0] : rs2[23:16];
+assign mem_wdata[31:24] = loadstore_addr[0] ? rs2 [7:0] : loadstore_addr[1] ? rs2[15:8] : rs2[31:24];
+
+wire[3:0] STORE_wmask = mem_byteAccess ? (loadstore_addr[1] ? (loadstore_addr[0] ? 4'b1000 : 4'b0100) : (loadstore_addr[0] ? 4'b0010 : 4'b0001)) : mem_halfwordAccess ? (loadstore_addr[1] ? 4'b1100 : 4'b0011) : 4'b1111;
+
+//State Machine 
+
+localparam  FETCH_INSTR_bit = 0;
+localparam WAIT_INSTR_bit =1;
+localparam EXECUTE_bit =2;
+localparam WAIT_ALU_OR_MEM_bit =3;
+localparam NB_STATES =4;
+
+localparam FETCH_INSTR = 1 << FETCH_INSTR_bit;
+localparam WAIT_INSTR = 1 << WAIT_INSTR_bit;
+localparam EXECUTE = 1 << EXECUTE_bit;
+localparam WAIT_ALU_OR_MEM =1 << WAIT_ALU_OR_MEM_bit;
+
+reg [NB_STATES-1:0] state ;
