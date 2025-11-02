@@ -59,7 +59,7 @@ reg [31:0] registerFile [31:0];
 
 always@(posedge clk)
 begin
-    if(writeback)
+    if(writeBack)
         if(rdId !=0)
             registerFile[rdId] <= writeBackData;
 end
@@ -184,4 +184,78 @@ localparam WAIT_INSTR = 1 << WAIT_INSTR_bit;
 localparam EXECUTE = 1 << EXECUTE_bit;
 localparam WAIT_ALU_OR_MEM =1 << WAIT_ALU_OR_MEM_bit;
 
-reg [NB_STATES-1:0] state ;
+reg [NB_STATES-1:0] state ;//one hot encoding 
+
+wire writeBack = ~(isBranch | isStore) & (state[EXECUTE_bit] | state[WAIT_ALU_OR_MEM_bit]);
+
+assign mem_rstrb = state[EXECUTE_bit] & isLoad | state[FETCH_INSTR_bit];
+
+assign mem_wmask = {4{state[EXECUTE_bit] & isStore}} &  STORE_wmask;
+
+assign aluWr = state[EXECUTE_bit] & isALU;
+
+wire jumpToPCPlusImm = isJAL | (isBranch & predicate);
+`ifdef NRV_IS_IO_ADDR
+    wire needToWait = isLoad | isStore & `NRV_IS_IO_ADDR(mem_addr) | isALU & funct3IsShift;
+`else 
+    wire needToWait = isLoad | isStore | isALU & funct3IsShift;
+`endif 
+
+always @(posedge clk) begin
+    if(!reset) 
+        begin
+            state <= WAIT_ALU_OR_MEM;
+            PC <= RESET_ADDR[ADDR_WIDTH -1:0];
+        end
+    else
+    case(1'b1)
+    state[WAIT_INSTR_bit]: 
+    begin
+        if(!mem_rbusy)
+        begin
+            rs1 <= registerFile[mem_rdata[19:15]];
+            rs2 <= registerFile[mem_rdata[24:20]];
+            instr <= mem_rdata[31:2];
+            state <= EXECUTE;
+        end
+    end
+
+    state[EXECUTE_bit]:
+    begin
+        PC <= isJALR ? {aluPlus[ADDR_WIDTH-1:1],1'b0} : jumpToPCPlusImm ? PCplusImm : PCplus4;
+        state <= needToWait ? WAIT_ALU_OR_MEM : FETCH_INSTR;
+    end
+
+    state[WAIT_ALU_OR_MEM_bit]:
+    begin
+        if(!aluBusy & !mem_rbusy & !mem_wbusy)
+            state <= FETCH_INSTR;
+    end
+
+    default:
+    begin
+        state <= WAIT_INSTR;
+    end
+
+    endcase
+
+end
+
+//cycle counter
+
+`ifdef NRV_COUNTER_WIDTH
+    reg[`NRV_COUNTER_WIDTH-1:0] cycles;
+`else
+    reg[31:0] cycles;
+`endif 
+    always@(posedge clk) cycles <= cycles + 1;
+
+`idef BENCH
+    initial begin
+        cycles = 0;
+        aluShamt =0;
+        registerFile[0] = 0;
+    end
+`endif
+
+endmodule
